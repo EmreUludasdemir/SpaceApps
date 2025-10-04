@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+.env
+.ipynb_checkpoints/
+.DS_Store
+
+# Data caches
+/data/
+/models/*.joblib
+/models/*.json
