@@ -1,193 +1,287 @@
-"""Script to train the exoplanet classification model with cross-validated ensembles."""
+"""Train and optimise the stacking-based exoplanet classifier."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict, List
 
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.model_selection import GridSearchCV, RepeatedStratifiedKFold, train_test_split
+from sklearn.utils import resample
 
-from .data import KOI_FEATURE_COLUMNS, load_koi_dataframe, split_features_and_target
+from .data import PreparedDataset, load_koi_dataframe, preprocess_koi_dataframe
 from .model import (
-    MODEL_REGISTRY,
-    build_model,
-    cross_validate_model,
-    evaluate_predictions,
-    get_model_registry,
+    MODEL_DESCRIPTION,
+    STACKING_PARAM_GRID,
+    ThresholdedClassifier,
+    build_training_pipeline,
+    cross_validate_pipeline,
+    evaluate_thresholds,
     save_metrics,
     save_model,
-    tune_hyperparameters,
+    specificity_macro_scorer,
 )
 
 LOGGER = logging.getLogger(__name__)
+
 DEFAULT_MODEL_PATH = Path("models/exoplanet_classifier.joblib")
 DEFAULT_METRICS_PATH = Path("models/metrics.json")
-DEFAULT_FEATURE_IMPORTANCE_PATH = Path("models/feature_importances.json")
-DEFAULT_SELECTION_METRIC = "f1_macro"
+DEFAULT_VALIDATION_SIZE = 0.2
+DEFAULT_CV_FOLDS = 10
+DEFAULT_CV_REPEATS = 5
 
 
-def _select_best_model(cross_validation_results: Dict[str, Dict[str, object]], metric: str) -> str:
-    """Return the model name with the highest mean value for the given metric."""
+def _balance_classes(dataset: PreparedDataset, random_state: int) -> PreparedDataset:
+    frame = dataset.features.copy()
+    frame["target"] = dataset.target
 
-    best_model = None
-    best_score = float("-inf")
-    for name, payload in cross_validation_results.items():
-        metrics = payload.get("metrics", {})
-        summary = metrics.get(metric)
-        if not summary:
-            continue
-        score = summary.get("mean", float("nan"))
-        if np.isnan(score):
-            continue
-        if score > best_score:
-            best_model = name
-            best_score = score
-    if best_model is None:
-        raise RuntimeError(f"Unable to determine best model using metric '{metric}'.")
-    return best_model
+    grouped = []
+    min_count = frame["target"].value_counts().min()
+    for label, group in frame.groupby("target"):
+        grouped.append(
+            resample(
+                group,
+                replace=False,
+                n_samples=min_count,
+                random_state=random_state,
+            )
+        )
+
+    balanced = pd.concat(grouped, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+    return PreparedDataset(
+        features=balanced.drop(columns=["target"]),
+        target=balanced["target"].astype(int),
+        numeric_features=dataset.numeric_features,
+        categorical_features=dataset.categorical_features,
+        label_mapping=dataset.label_mapping,
+    )
 
 
-def _extract_feature_importances(pipeline, feature_importance_path: Path | str) -> None:
-    """Persist feature importances when exposed by the trained classifier."""
+def _compute_specificity_by_class(conf: np.ndarray, labels: List[str]) -> Dict[str, float]:
+    totals = {}
+    conf = np.asarray(conf)
+    for idx, label in enumerate(labels):
+        tp = conf[idx, idx]
+        fp = conf[:, idx].sum() - tp
+        fn = conf[idx, :].sum() - tp
+        tn = conf.sum() - (tp + fp + fn)
+        denom = tn + fp
+        totals[label] = float(tn / denom) if denom else float("nan")
+    totals["macro"] = float(np.nanmean([totals[label] for label in labels]))
+    return totals
 
-    classifier = pipeline.named_steps.get("classifier")
-    if classifier is None:
-        LOGGER.warning("Pipeline does not expose a classifier step; skipping feature importance export.")
-        return
 
-    feature_importances = None
-    if hasattr(classifier, "feature_importances_"):
-        feature_importances = classifier.feature_importances_
-    elif hasattr(classifier, "estimators_") and all(
-        hasattr(estimator, "feature_importances_") for estimator in getattr(classifier, "estimators_", [])
-    ):
-        importances = [estimator.feature_importances_ for estimator in classifier.estimators_]
-        feature_importances = np.mean(importances, axis=0)
-
-    if feature_importances is None:
-        LOGGER.info("Selected classifier does not provide feature importances; skipping export.")
-        return
-
-    payload = {
-        "features": list(KOI_FEATURE_COLUMNS),
-        "importances": feature_importances.tolist(),
-    }
-    feature_path = Path(feature_importance_path)
-    feature_path.parent.mkdir(parents=True, exist_ok=True)
-    feature_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    LOGGER.info("Persisted feature importances to %s", feature_path)
+def _select_best_params(grid: GridSearchCV) -> Dict[str, object]:
+    specificity_scores = grid.cv_results_["mean_test_specificity_macro"]
+    best_specificity = np.max(specificity_scores)
+    candidate_indices = np.flatnonzero(np.isclose(specificity_scores, best_specificity))
+    if candidate_indices.size == 1:
+        best_index = int(candidate_indices[0])
+    else:
+        f1_scores = grid.cv_results_["mean_test_f1_macro"][candidate_indices]
+        best_index = int(candidate_indices[np.argmax(f1_scores)])
+    return grid.cv_results_["params"][best_index]
 
 
 def train(
     *,
-    model_name: str = "gradient_boosting",
-    random_state: int = 42,
     refresh_data: bool = False,
+    random_state: int = 42,
     model_path: Path | str = DEFAULT_MODEL_PATH,
     metrics_path: Path | str = DEFAULT_METRICS_PATH,
-    feature_importance_path: Path | str = DEFAULT_FEATURE_IMPORTANCE_PATH,
-    cv_splits: int = 5,
-    auto_select: bool = False,
-    selection_metric: str = DEFAULT_SELECTION_METRIC,
-    tune: bool = False,
-    tuning_metric: str = DEFAULT_SELECTION_METRIC,
-    tuning_iterations: int = 10,
+    validation_size: float = DEFAULT_VALIDATION_SIZE,
+    cv_folds: int = DEFAULT_CV_FOLDS,
+    cv_repeats: int = DEFAULT_CV_REPEATS,
+    disable_tuning: bool = False,
 ) -> Dict[str, object]:
-    """Train the classifier, evaluate ensembles via cross-validation, and persist artefacts."""
-
     start_time = time.perf_counter()
 
-    df = load_koi_dataframe(refresh=refresh_data)
-    X, y = split_features_and_target(df)
-    labels: Iterable[str] = sorted(y.unique())
+    raw_df = load_koi_dataframe(refresh=refresh_data)
+    dataset = preprocess_koi_dataframe(raw_df)
+    balanced_dataset = _balance_classes(dataset, random_state=random_state)
 
-    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=random_state)
-    candidate_models = list(MODEL_REGISTRY) if auto_select else [model_name]
+    X_train, X_val, y_train, y_val = train_test_split(
+        balanced_dataset.features,
+        balanced_dataset.target,
+        test_size=validation_size,
+        random_state=random_state,
+        stratify=balanced_dataset.target,
+    )
 
-    cross_validation_payload: Dict[str, Dict[str, object]] = {}
-    for candidate in candidate_models:
-        LOGGER.info("Evaluating %s via %d-fold stratified CV", candidate, cv_splits)
-        pipeline = build_model(candidate, random_state=random_state)
-        result = cross_validate_model(pipeline, X, y, cv=cv, labels=labels)
-        cross_validation_payload[candidate] = {
-            "description": MODEL_REGISTRY[candidate].description,
-            **result,
+    label_names = sorted(balanced_dataset.label_mapping, key=balanced_dataset.label_mapping.get)
+    positive_label = balanced_dataset.label_mapping[label_names[-1]]
+
+    pipeline = build_training_pipeline(
+        numeric_features=balanced_dataset.numeric_features,
+        categorical_features=balanced_dataset.categorical_features,
+        random_state=random_state,
+    )
+
+    tuning_payload = None
+    best_params = None
+
+    if not disable_tuning:
+        scoring = {
+            "specificity_macro": specificity_macro_scorer,
+            "f1_macro": "f1_macro",
+            "accuracy": "accuracy",
         }
-
-    if model_name not in MODEL_REGISTRY:
-        raise KeyError(f"Unknown model '{model_name}'. Available models: {sorted(MODEL_REGISTRY)}")
-
-    selected_model = model_name
-    if auto_select:
-        selected_model = _select_best_model(cross_validation_payload, selection_metric)
-        LOGGER.info("Auto-selected %s based on %s", selected_model, selection_metric)
-
-    best_pipeline = build_model(selected_model, random_state=random_state)
-    tuning_payload: Dict[str, object] | None = None
-    if tune:
-        tuning_payload = tune_hyperparameters(
-            best_pipeline,
-            model_name=selected_model,
-            X=X,
-            y=y,
-            cv=cv,
-            scoring=tuning_metric,
-            n_iter=tuning_iterations,
+        cv = RepeatedStratifiedKFold(
+            n_splits=cv_folds,
+            n_repeats=cv_repeats,
             random_state=random_state,
         )
-        if tuning_payload.get("enabled") and tuning_payload.get("best_params"):
-            best_params = tuning_payload["best_params"]
-            LOGGER.info("Applying tuned parameters for %s: %s", selected_model, best_params)
-            best_pipeline.set_params(**best_params)
-        else:
-            LOGGER.info(
-                "Hyperparameter tuning skipped for %s (reason: %s)",
-                selected_model,
-                tuning_payload.get("reason"),
-            )
+        grid = GridSearchCV(
+            estimator=pipeline,
+            param_grid=STACKING_PARAM_GRID,
+            scoring=scoring,
+            cv=cv,
+            n_jobs=-1,
+            refit=False,
+            verbose=0,
+        )
+        total_combinations = int(np.prod([len(values) for values in STACKING_PARAM_GRID.values()]))
+        LOGGER.info(
+            "Running GridSearchCV with %d combinations and %d-fold x %d-repeat CV",
+            total_combinations,
+            cv_folds,
+            cv_repeats,
+        )
+        grid.fit(X_train, y_train)
+        best_params = _select_best_params(grid)
+        LOGGER.info("Selected tuned parameters: %s", best_params)
+        tuning_payload = {
+            "best_params": best_params,
+            "cv_results": {
+                key: grid.cv_results_[key].tolist()
+                for key in grid.cv_results_.keys()
+                if key.startswith("mean_test")
+            },
+            "params": grid.cv_results_["params"],
+        }
+        pipeline.set_params(**best_params)
 
-    LOGGER.info("Generating cross-validated predictions for %s", selected_model)
-    cv_predictions = cross_val_predict(best_pipeline, X, y, cv=cv)
-    evaluation = evaluate_predictions(y, cv_predictions, labels)
+    cv = RepeatedStratifiedKFold(n_splits=cv_folds, n_repeats=cv_repeats, random_state=random_state)
+    cv_payload = cross_validate_pipeline(pipeline, X_train, y_train, cv=cv, positive_label=positive_label)
 
-    LOGGER.info("Fitting %s on full dataset (%d samples)", selected_model, len(X))
-    best_pipeline.fit(X, y)
+    LOGGER.info("Fitting pipeline on training set (%d samples)", len(X_train))
+    pipeline.fit(X_train, y_train)
 
-    save_model(best_pipeline, model_path)
-    _extract_feature_importances(best_pipeline, feature_importance_path)
+    val_probabilities = pipeline.predict_proba(X_val)[:, positive_label]
+    baseline_preds = (val_probabilities >= 0.5).astype(int)
+    baseline_conf = confusion_matrix(y_val, baseline_preds, labels=list(balanced_dataset.label_mapping.values()))
+    baseline_specificity = _compute_specificity_by_class(baseline_conf, label_names)
 
-    summary_metrics = {
-        key: evaluation[key]
-        for key in ["accuracy", "precision_macro", "recall_macro", "f1_macro", "specificity_macro"]
-        if key in evaluation
+    baseline_metrics = {
+        "accuracy": float(accuracy_score(y_val, baseline_preds)),
+        "precision_macro": float(precision_score(y_val, baseline_preds, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_val, baseline_preds, average="macro", zero_division=0)),
+        "f1_macro": float(f1_score(y_val, baseline_preds, average="macro", zero_division=0)),
+        "specificity_macro": float(baseline_specificity["macro"]),
     }
+
+    threshold_payload = evaluate_thresholds(
+        y_true=y_val.to_numpy(),
+        probabilities=val_probabilities,
+        positive_label=positive_label,
+        baseline_f1=baseline_metrics["f1_macro"],
+    )
+
+    best_threshold = threshold_payload.get("best_threshold", 0.5)
+    best_preds = (val_probabilities >= best_threshold).astype(int)
+    best_conf = confusion_matrix(y_val, best_preds, labels=list(balanced_dataset.label_mapping.values()))
+    best_specificity = _compute_specificity_by_class(best_conf, label_names)
+
+    best_metrics = {
+        "accuracy": float(accuracy_score(y_val, best_preds)),
+        "precision_macro": float(precision_score(y_val, best_preds, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_val, best_preds, average="macro", zero_division=0)),
+        "f1_macro": float(f1_score(y_val, best_preds, average="macro", zero_division=0)),
+        "specificity_macro": float(best_specificity["macro"]),
+    }
+
+    classification = classification_report(
+        y_val,
+        best_preds,
+        labels=list(balanced_dataset.label_mapping.values()),
+        target_names=label_names,
+        zero_division=0,
+        output_dict=True,
+    )
+
+    metrics_summary = {
+        "accuracy": best_metrics["accuracy"],
+        "precision_macro": best_metrics["precision_macro"],
+        "recall_macro": best_metrics["recall_macro"],
+        "f1_macro": best_metrics["f1_macro"],
+        "specificity_macro": best_metrics["specificity_macro"],
+    }
+
+    balanced_full = PreparedDataset(
+        features=balanced_dataset.features,
+        target=balanced_dataset.target,
+        numeric_features=balanced_dataset.numeric_features,
+        categorical_features=balanced_dataset.categorical_features,
+        label_mapping=balanced_dataset.label_mapping,
+    )
+
+    LOGGER.info("Fitting final model on balanced dataset (%d samples)", len(balanced_full.features))
+    final_pipeline = build_training_pipeline(
+        numeric_features=balanced_full.numeric_features,
+        categorical_features=balanced_full.categorical_features,
+        random_state=random_state,
+    )
+    if best_params:
+        final_pipeline.set_params(**best_params)
+    final_pipeline.fit(balanced_full.features, balanced_full.target)
+
+    thresholded_model = ThresholdedClassifier(
+        final_pipeline,
+        threshold=best_threshold,
+        label_mapping=balanced_full.label_mapping,
+    )
+    save_model(thresholded_model, model_path)
 
     metrics_payload: Dict[str, object] = {
-        "version": 2,
-        "best_model": selected_model,
-        "best_model_description": MODEL_REGISTRY[selected_model].description,
-        "metrics": summary_metrics,
-        "specificity_by_class": evaluation.get("specificity_by_class", {}),
-        "classification_report": evaluation.get("classification_report"),
-        "confusion_matrix": evaluation.get("confusion_matrix"),
-        "labels": evaluation.get("labels"),
+        "version": 3,
+        "model_description": MODEL_DESCRIPTION,
+        "metrics": metrics_summary,
+        "validation": {
+            "baseline_threshold": 0.5,
+            "baseline_metrics": baseline_metrics,
+            "best_threshold": best_threshold,
+            "best_metrics": best_metrics,
+            "confusion_matrix": best_conf.tolist(),
+            "specificity_by_class": best_specificity,
+            "classification_report": classification,
+        },
+        "threshold": threshold_payload,
         "cross_validation": {
-            "folds": cv_splits,
-            "selection_metric": selection_metric,
-            "results": cross_validation_payload,
+            "folds": cv_folds,
+            "repeats": cv_repeats,
+            "per_fold": cv_payload["per_fold"],
+            "summary": cv_payload["metrics"],
         },
         "tuning": tuning_payload,
-        "dataset_size": len(df),
-        "feature_columns": list(KOI_FEATURE_COLUMNS),
+        "feature_columns": {
+            "numeric": balanced_full.numeric_features,
+            "categorical": balanced_full.categorical_features,
+        },
+        "label_mapping": balanced_full.label_mapping,
+        "dataset": {
+            "total_records": int(len(dataset.features)),
+            "balanced_records": int(len(balanced_full.features)),
+            "validation_size": validation_size,
+        },
     }
 
-    # Provide backward-compatible top-level keys for Streamlit visualisations.
-    metrics_payload.update(summary_metrics)
+    metrics_payload.update(metrics_summary)
 
     save_metrics(metrics_payload, metrics_path)
     elapsed = time.perf_counter() - start_time
@@ -198,50 +292,20 @@ def train(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model",
-        choices=sorted(get_model_registry().keys()),
-        default="gradient_boosting",
-        help="Name of the ensemble to train.",
-    )
     parser.add_argument("--refresh-data", action="store_true", help="Force re-download of the KOI dataset")
-    parser.add_argument("--random-state", type=int, default=42, help="Random seed for data splitting and model")
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH, help="Path to store the trained model")
-    parser.add_argument("--metrics-path", type=Path, default=DEFAULT_METRICS_PATH, help="Path to store evaluation metrics")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed")
+    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH, help="Where to store the trained model")
+    parser.add_argument("--metrics-path", type=Path, default=DEFAULT_METRICS_PATH, help="Where to store metrics JSON")
     parser.add_argument(
-        "--feature-importance-path",
-        type=Path,
-        default=DEFAULT_FEATURE_IMPORTANCE_PATH,
-        help="Path to store feature importance values",
+        "--validation-size",
+        type=float,
+        default=DEFAULT_VALIDATION_SIZE,
+        help="Validation split ratio used for threshold optimisation",
     )
-    parser.add_argument("--cv-splits", type=int, default=5, help="Number of cross-validation folds")
-    parser.add_argument(
-        "--auto-select",
-        action="store_true",
-        help="Evaluate all registered ensembles and persist the best performer",
-    )
-    parser.add_argument(
-        "--selection-metric",
-        default=DEFAULT_SELECTION_METRIC,
-        help="Metric used to determine the best model when auto-selecting",
-    )
-    parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run hyperparameter search for the selected model before final training",
-    )
-    parser.add_argument(
-        "--tuning-metric",
-        default=DEFAULT_SELECTION_METRIC,
-        help="Metric optimised during hyperparameter search",
-    )
-    parser.add_argument(
-        "--tuning-iterations",
-        type=int,
-        default=10,
-        help="Number of hyperparameter combinations to evaluate when tuning",
-    )
-    parser.add_argument("--log-level", default="INFO", help="Logging level (e.g. INFO, DEBUG)")
+    parser.add_argument("--cv-folds", type=int, default=DEFAULT_CV_FOLDS, help="Number of CV folds")
+    parser.add_argument("--cv-repeats", type=int, default=DEFAULT_CV_REPEATS, help="Number of CV repetitions")
+    parser.add_argument("--disable-tuning", action="store_true", help="Skip GridSearchCV and use default parameters")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
 
@@ -249,18 +313,14 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
     train(
-        model_name=args.model,
         refresh_data=args.refresh_data,
         random_state=args.random_state,
         model_path=args.model_path,
         metrics_path=args.metrics_path,
-        feature_importance_path=args.feature_importance_path,
-        cv_splits=args.cv_splits,
-        auto_select=args.auto_select,
-        selection_metric=args.selection_metric,
-        tune=args.tune,
-        tuning_metric=args.tuning_metric,
-        tuning_iterations=args.tuning_iterations,
+        validation_size=args.validation_size,
+        cv_folds=args.cv_folds,
+        cv_repeats=args.cv_repeats,
+        disable_tuning=args.disable_tuning,
     )
 
 

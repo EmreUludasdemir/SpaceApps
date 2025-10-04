@@ -1,16 +1,18 @@
 # Exoplanet Transit Classification Toolkit
 
-This project provides a reproducible machine-learning pipeline and interactive Streamlit dashboard for classifying candidates from NASA's Kepler Objects of Interest (KOI) catalogue. It automatically downloads publicly available KOI data, evaluates multiple ensemble models with cross-validation, and exposes an interface for exploring the dataset and predicting dispositions for new observations.
+This project provides a reproducible machine-learning pipeline and interactive Streamlit dashboard for classifying candidates from NASA's Kepler Objects of Interest (KOI) catalogue. It automatically downloads the public KOI table, performs the preprocessing steps recommended in the ensemble-focused literature, and trains an optimised stacking model that maximises macro specificity while maintaining strong macro F1 and accuracy. The resulting artefacts feed a Streamlit interface for exploring the balanced dataset, inspecting evaluation outputs, tuning decision thresholds, and predicting dispositions for new observations.
 
 ## Features
 
-- Automated download of a curated subset of the KOI dataset directly from the NASA Exoplanet Archive `nstedAPI` service.
-- Registry of ensemble classifiers (Gradient Boosting, Random Forest, Extra Trees, AdaBoost, Random Subspace, Stacking) with cross-validated scoring, auto-selection, and macro-metric tracking inspired by recent exoplanet vetting studies. [MNRAS 513, 5505](https://academic.oup.com/mnras/article/513/4/5505/6472249) discusses the importance of minimising false positives, while [Luz et al. 2024](https://www.mdpi.com/2079-9292/13/19/3950) benchmarks ensemble pipelines for KOI data.
-- Persisted model artefacts (trained model, metrics, feature importances) for reproducible inference.
-- Streamlit application with:
-  - Performance dashboard (macro accuracy/F1/specificity, classification report, specificity-by-class, confusion matrix, cross-validation leaderboard, feature importance).
-  - Dataset explorer with filtering and feature distribution visualisations.
-  - Manual prediction form and batch CSV upload for new candidate classification.
+- Automated KOI ingestion: the training script retrieves the latest catalogue via NASA's `nstedAPI`, removes identifier columns, filters to confirmed/candidate dispositions, converts the target into a binary label (`CONFIRMED` = 0, `CANDIDATE` = 1), imputes categorical delivery names, and balances the classes through down-sampling.
+- Stacking ensemble tailored to the KOI task: Random Forest, Extra Trees, and XGBoost base learners feed a logistic regression meta-learner (as recommended by [MNRAS 513, 5505](https://academic.oup.com/mnras/article/513/4/5505/6472249) and [Luz et al. 2024](https://www.mdpi.com/2079-9292/13/19/3950)).
+- Hyperparameter optimisation: `GridSearchCV` evaluates a curated grid under 10-fold, 5-repeat stratified cross-validation and selects the configuration with the highest macro specificity (breaking ties with macro F1).
+- Threshold tuning: after training, the script sweeps probability thresholds on a validation split, optimising macro specificity while enforcing the baseline macro F1, and records the best trade-off alongside a precision–recall curve.
+- Persisted artefacts: the tuned stacking pipeline, threshold wrapper, metrics (including per-fold diagnostics, validation confusion matrix, and threshold sweep), and feature lists are saved under `models/`.
+- Streamlit dashboard with:
+  - Validation metrics (accuracy, macro F1, macro specificity), class-wise specificity bars, confusion matrix, classification report, threshold sweep visualisation, and cross-validation summary.
+  - Balanced dataset explorer with filtering and feature distribution charts.
+  - Manual prediction form and batch CSV upload that respect the tuned threshold for inference.
 
 ## Getting started
 
@@ -22,20 +24,21 @@ This project provides a reproducible machine-learning pipeline and interactive S
    pip install -r requirements.txt
    ```
 
-2. **Train the model** (downloads the latest KOI data and saves artefacts under `models/`):
+2. **Train and optimise the model** (downloads the latest KOI data and saves artefacts under `models/`):
 
    ```bash
-   python -m src.train --auto-select
+   python -m src.train
    ```
+
+   By default the command performs 10×5 repeated stratified cross-validation, grid-searches the stacking ensemble hyperparameters, tunes the probability threshold on a held-out validation split, and finally retrains the model on the balanced dataset with the best configuration. Training can take several minutes on a CPU-only machine because of the repeated CV and GridSearchCV runs.
 
    Useful flags:
 
-   - `--refresh-data` — force re-download of the KOI dataset.
-   - `--model {name}` — train a specific ensemble from the registry.
-   - `--auto-select` — evaluate all registered ensembles and persist the best performer.
-   - `--selection-metric {metric}` — choose the metric used for automatic selection (default: `f1_macro`).
-   - `--cv-splits N` — adjust the number of stratified folds used during cross-validation (default: `5`).
-   - `--tune` — run a lightweight hyperparameter search before the final fit (combine with `--tuning-metric` and `--tuning-iterations`).
+   - `--refresh-data` — force a fresh download of the KOI dataset.
+   - `--validation-size 0.2` — change the proportion of balanced data reserved for threshold optimisation.
+   - `--cv-folds 10` / `--cv-repeats 5` — adjust the repeated stratified CV strategy.
+   - `--disable-tuning` — skip the GridSearchCV stage and use the baseline stacking parameters (helpful for quick iteration).
+   - `--model-path`, `--metrics-path` — customise where the trained artefacts are written.
 
 3. **Launch the Streamlit interface**:
 
@@ -47,25 +50,14 @@ This project provides a reproducible machine-learning pipeline and interactive S
 
 ### Interpreting evaluation outputs
 
-- **Cross-validation metrics** – When you run `python -m src.train`, the script reports macro accuracy, macro F1, and macro specificity that are computed from stratified k-fold cross-validation on the downloaded KOI dataset. These values reflect real training runs; re-running the command on your machine reproduces them with the same preprocessing and model definitions.
-- **Artefact files** – The metrics displayed in the Streamlit dashboard are loaded from `models/metrics.json`, which is generated at the end of each training execution along with the saved estimator in `models/exoplanet_classifier.joblib` and feature importances in `models/feature_importances.json`.
-- **Testing status in docs** – Some documentation snippets in this repository include a “⚠️ Tests not run (read-only review)” note. This simply indicates that, for that specific write-up, automated tests were not re-executed; it does not invalidate the cross-validation metrics produced by the training pipeline.
-
-### Improving predictions with hyperparameter tuning
-
-- Pass `--tune` to `python -m src.train` to automatically evaluate a curated grid of hyperparameters for the selected ensemble and reuse the best configuration for cross-validation and final training. For example:
-
-  ```bash
-  python -m src.train --model random_forest --tune --tuning-metric f1_macro --tuning-iterations 12
-  ```
-
-- Each registry entry has an associated search space covering key parameters (tree depth, estimator counts, learning rates, etc.) distilled from the ensemble studies cited above. The CLI logs the progress of the search and the best-performing combination, which is also stored inside `models/metrics.json` for later inspection.
-
-- You can increase or decrease the search effort by adjusting `--tuning-iterations`. Setting this to the total number of grid combinations will perform an exhaustive search; smaller values execute a random subset for faster feedback.
+- **Cross-validation metrics** – The `cross_validation` section of `models/metrics.json` stores the mean and standard deviation of accuracy, macro precision/recall/F1, and macro specificity across all 50 folds, as well as fold-level true negative/false positive counts.
+- **Validation metrics & threshold** – The `validation` section captures the baseline (0.5) threshold results and the optimised threshold metrics, confusion matrix, per-class specificity, and classification report. These are the values surfaced in the Streamlit dashboard.
+- **Threshold sweep** – `threshold.candidates` records the macro specificity and macro F1 achieved at each evaluated probability threshold so you can audit the precision–recall trade-off. The chosen threshold is also embedded in the persisted model and used for all manual/batch predictions.
+- **Artefact files** – Training produces `models/exoplanet_classifier.joblib` (stacking pipeline wrapped with the tuned threshold) and `models/metrics.json` (detailed evaluation payload). Re-running the command with the same random seed reproduces the metrics thanks to deterministic preprocessing and balancing.
 
 ## Research alignment
 
-The expanded evaluation workflow follows guidance from recent literature that emphasises ensemble diversity, cross-validation, and explicit monitoring of false-positive rates when working with KOI- and TESS-like catalogues. [Luz et al. 2024](https://www.mdpi.com/2079-9292/13/19/3950) demonstrate that tuned ensemble methods (e.g., Random Forest, Extra Trees, Stacking) deliver superior macro metrics across KOI folds; we mirror this by exposing a registry of comparable ensembles, exporting fold-wise timings, and ranking models by macro F1. Complementary recommendations from [MNRAS 513, 5505](https://academic.oup.com/mnras/article/513/4/5505/6472249) motivate tracking specificity alongside precision/recall to better differentiate astrophysical false positives, so the dashboard now surfaces macro specificity and class-wise true negative rates.
+The training pipeline mirrors the best practices highlighted by recent ensemble studies on KOI data. [MNRAS 513, 5505](https://academic.oup.com/mnras/article/513/4/5505/6472249) emphasises the need for ensemble diversity, repeated cross-validation, and explicit monitoring of specificity to keep false positives under control. [Luz et al. 2024](https://www.mdpi.com/2079-9292/13/19/3950) reports that stacking combinations of tree-based models yield superior macro metrics once hyperparameters are tuned and imbalanced classes are addressed. This repository encodes those recommendations via the balanced stacking pipeline, repeated CV grid search, macro specificity-driven selection, and post-hoc threshold optimisation exposed through the dashboard.
 
 ## Repository layout
 
@@ -78,9 +70,9 @@ The expanded evaluation workflow follows guidance from recent literature that em
 ├── requirements.txt       # Python dependencies
 └── src/
     ├── __init__.py
-    ├── data.py            # Data download and loading helpers
-    ├── model.py           # Model construction and evaluation utilities
-    └── train.py           # Training entry point with cross-validation
+    ├── data.py            # Data download, preprocessing, and balancing helpers
+    ├── model.py           # Stacking pipeline, CV, threshold optimisation utilities
+    └── train.py           # Training entry point with grid search + validation workflow
 ```
 
 ## Data source
