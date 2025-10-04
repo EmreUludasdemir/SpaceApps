@@ -44,6 +44,12 @@ This project provides a reproducible machine-learning pipeline and interactive S
 
    The dashboard will be available at <http://localhost:8501> by default.
 
+### Interpreting evaluation outputs
+
+- **Cross-validation metrics** – When you run `python -m src.train`, the script reports macro accuracy, macro F1, and macro specificity that are computed from stratified k-fold cross-validation on the downloaded KOI dataset. These values reflect real training runs; re-running the command on your machine reproduces them with the same preprocessing and model definitions.
+- **Artefact files** – The metrics displayed in the Streamlit dashboard are loaded from `models/metrics.json`, which is generated at the end of each training execution along with the saved estimator in `models/exoplanet_classifier.joblib` and feature importances in `models/feature_importances.json`.
+- **Testing status in docs** – Some documentation snippets in this repository include a “⚠️ Tests not run (read-only review)” note. This simply indicates that, for that specific write-up, automated tests were not re-executed; it does not invalidate the cross-validation metrics produced by the training pipeline.
+
 ## Research alignment
 
 The expanded evaluation workflow follows guidance from recent literature that emphasises ensemble diversity, cross-validation, and explicit monitoring of false-positive rates when working with KOI- and TESS-like catalogues. [Luz et al. 2024](https://www.mdpi.com/2079-9292/13/19/3950) demonstrate that tuned ensemble methods (e.g., Random Forest, Extra Trees, Stacking) deliver superior macro metrics across KOI folds; we mirror this by exposing a registry of comparable ensembles, exporting fold-wise timings, and ranking models by macro F1. Complementary recommendations from [MNRAS 513, 5505](https://academic.oup.com/mnras/article/513/4/5505/6472249) motivate tracking specificity alongside precision/recall to better differentiate astrophysical false positives, so the dashboard now surfaces macro specificity and class-wise true negative rates.
