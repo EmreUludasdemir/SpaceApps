@@ -35,6 +35,7 @@ This project provides a reproducible machine-learning pipeline and interactive S
    - `--auto-select` — evaluate all registered ensembles and persist the best performer.
    - `--selection-metric {metric}` — choose the metric used for automatic selection (default: `f1_macro`).
    - `--cv-splits N` — adjust the number of stratified folds used during cross-validation (default: `5`).
+   - `--tune` — run a lightweight hyperparameter search before the final fit (combine with `--tuning-metric` and `--tuning-iterations`).
 
 3. **Launch the Streamlit interface**:
 
@@ -49,6 +50,18 @@ This project provides a reproducible machine-learning pipeline and interactive S
 - **Cross-validation metrics** – When you run `python -m src.train`, the script reports macro accuracy, macro F1, and macro specificity that are computed from stratified k-fold cross-validation on the downloaded KOI dataset. These values reflect real training runs; re-running the command on your machine reproduces them with the same preprocessing and model definitions.
 - **Artefact files** – The metrics displayed in the Streamlit dashboard are loaded from `models/metrics.json`, which is generated at the end of each training execution along with the saved estimator in `models/exoplanet_classifier.joblib` and feature importances in `models/feature_importances.json`.
 - **Testing status in docs** – Some documentation snippets in this repository include a “⚠️ Tests not run (read-only review)” note. This simply indicates that, for that specific write-up, automated tests were not re-executed; it does not invalidate the cross-validation metrics produced by the training pipeline.
+
+### Improving predictions with hyperparameter tuning
+
+- Pass `--tune` to `python -m src.train` to automatically evaluate a curated grid of hyperparameters for the selected ensemble and reuse the best configuration for cross-validation and final training. For example:
+
+  ```bash
+  python -m src.train --model random_forest --tune --tuning-metric f1_macro --tuning-iterations 12
+  ```
+
+- Each registry entry has an associated search space covering key parameters (tree depth, estimator counts, learning rates, etc.) distilled from the ensemble studies cited above. The CLI logs the progress of the search and the best-performing combination, which is also stored inside `models/metrics.json` for later inspection.
+
+- You can increase or decrease the search effort by adjusting `--tuning-iterations`. Setting this to the total number of grid combinations will perform an exhaustive search; smaller values execute a random subset for faster feedback.
 
 ## Research alignment
 

@@ -21,6 +21,7 @@ from .model import (
     get_model_registry,
     save_metrics,
     save_model,
+    tune_hyperparameters,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -93,6 +94,9 @@ def train(
     cv_splits: int = 5,
     auto_select: bool = False,
     selection_metric: str = DEFAULT_SELECTION_METRIC,
+    tune: bool = False,
+    tuning_metric: str = DEFAULT_SELECTION_METRIC,
+    tuning_iterations: int = 10,
 ) -> Dict[str, object]:
     """Train the classifier, evaluate ensembles via cross-validation, and persist artefacts."""
 
@@ -124,6 +128,29 @@ def train(
         LOGGER.info("Auto-selected %s based on %s", selected_model, selection_metric)
 
     best_pipeline = build_model(selected_model, random_state=random_state)
+    tuning_payload: Dict[str, object] | None = None
+    if tune:
+        tuning_payload = tune_hyperparameters(
+            best_pipeline,
+            model_name=selected_model,
+            X=X,
+            y=y,
+            cv=cv,
+            scoring=tuning_metric,
+            n_iter=tuning_iterations,
+            random_state=random_state,
+        )
+        if tuning_payload.get("enabled") and tuning_payload.get("best_params"):
+            best_params = tuning_payload["best_params"]
+            LOGGER.info("Applying tuned parameters for %s: %s", selected_model, best_params)
+            best_pipeline.set_params(**best_params)
+        else:
+            LOGGER.info(
+                "Hyperparameter tuning skipped for %s (reason: %s)",
+                selected_model,
+                tuning_payload.get("reason"),
+            )
+
     LOGGER.info("Generating cross-validated predictions for %s", selected_model)
     cv_predictions = cross_val_predict(best_pipeline, X, y, cv=cv)
     evaluation = evaluate_predictions(y, cv_predictions, labels)
@@ -154,6 +181,7 @@ def train(
             "selection_metric": selection_metric,
             "results": cross_validation_payload,
         },
+        "tuning": tuning_payload,
         "dataset_size": len(df),
         "feature_columns": list(KOI_FEATURE_COLUMNS),
     }
@@ -197,6 +225,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SELECTION_METRIC,
         help="Metric used to determine the best model when auto-selecting",
     )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyperparameter search for the selected model before final training",
+    )
+    parser.add_argument(
+        "--tuning-metric",
+        default=DEFAULT_SELECTION_METRIC,
+        help="Metric optimised during hyperparameter search",
+    )
+    parser.add_argument(
+        "--tuning-iterations",
+        type=int,
+        default=10,
+        help="Number of hyperparameter combinations to evaluate when tuning",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (e.g. INFO, DEBUG)")
     return parser.parse_args()
 
@@ -214,6 +258,9 @@ def main() -> None:
         cv_splits=args.cv_splits,
         auto_select=args.auto_select,
         selection_metric=args.selection_metric,
+        tune=args.tune,
+        tuning_metric=args.tuning_metric,
+        tuning_iterations=args.tuning_iterations,
     )
 
 

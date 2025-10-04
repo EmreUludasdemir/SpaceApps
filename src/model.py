@@ -30,6 +30,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from sklearn.model_selection import ParameterGrid, ParameterSampler, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -170,6 +171,137 @@ def get_model_registry() -> Dict[str, ModelSpec]:
     """Return the registry of available ensemble configurations."""
 
     return MODEL_REGISTRY
+
+
+MODEL_TUNING_GRID: Dict[str, Dict[str, Iterable[object]]] = {
+    "gradient_boosting": {
+        "classifier__learning_rate": [0.03, 0.05, 0.08],
+        "classifier__n_estimators": [300, 400, 500],
+        "classifier__max_depth": [2, 3, 4],
+    },
+    "random_forest": {
+        "classifier__n_estimators": [200, 400, 600],
+        "classifier__max_depth": [None, 20, 40],
+        "classifier__max_features": ["sqrt", "log2", 0.5],
+        "classifier__min_samples_leaf": [1, 2, 4],
+    },
+    "extra_trees": {
+        "classifier__n_estimators": [200, 400, 600],
+        "classifier__max_depth": [None, 20, 40],
+        "classifier__max_features": ["sqrt", "log2", 0.5],
+        "classifier__min_samples_leaf": [1, 2, 4],
+    },
+    "ada_boost": {
+        "classifier__n_estimators": [200, 400, 600],
+        "classifier__learning_rate": [0.1, 0.3, 0.5],
+        "classifier__estimator__max_depth": [2, 3, 4],
+    },
+    "random_subspace": {
+        "classifier__n_estimators": [200, 400, 600],
+        "classifier__max_features": [0.5, 0.6, 0.8],
+        "classifier__estimator__max_depth": [None, 12, 24],
+        "classifier__estimator__min_samples_leaf": [1, 2, 4],
+    },
+    "stacking": {
+        "classifier__final_estimator__C": [0.3, 1.0, 3.0],
+        "classifier__final_estimator__penalty": ["l2"],
+        "classifier__final_estimator__solver": ["lbfgs"],
+    },
+}
+
+
+def get_tuning_grid(model_name: str) -> Dict[str, Iterable[object]] | None:
+    """Return the hyperparameter grid for a given model, if available."""
+
+    return MODEL_TUNING_GRID.get(model_name)
+
+
+def _count_param_combinations(grid: Dict[str, Iterable[object]]) -> int:
+    """Return the total number of combinations in a parameter grid."""
+
+    try:
+        return len(ParameterGrid(grid))
+    except Exception:  # noqa: BLE001
+        # Fall back to a simple product computation.
+        count = 1
+        for values in grid.values():
+            count *= len(list(values))
+        return count
+
+
+def tune_hyperparameters(
+    pipeline: Pipeline,
+    *,
+    model_name: str,
+    X,
+    y,
+    cv,
+    scoring: str,
+    n_iter: int,
+    random_state: int,
+) -> Dict[str, object]:
+    """Perform lightweight hyperparameter search for the provided pipeline."""
+
+    grid = get_tuning_grid(model_name)
+    if not grid:
+        LOGGER.info("No tuning grid defined for %s; skipping hyperparameter search.", model_name)
+        return {"enabled": False, "reason": "no_grid"}
+
+    total_combinations = _count_param_combinations(grid)
+    iterations = min(max(n_iter, 1), total_combinations)
+    sampler = list(ParameterSampler(grid, n_iter=iterations, random_state=random_state))
+
+    best_params: Dict[str, object] | None = None
+    best_score = float("-inf")
+    evaluations = []
+
+    LOGGER.info(
+        "Running hyperparameter search for %s (%d/%d combinations sampled) using %s",
+        model_name,
+        iterations,
+        total_combinations,
+        scoring,
+    )
+
+    for index, params in enumerate(sampler, start=1):
+        candidate = clone(pipeline)
+        candidate.set_params(**params)
+        start = time.perf_counter()
+        scores = cross_val_score(candidate, X, y, cv=cv, scoring=scoring)
+        duration = float(time.perf_counter() - start)
+        mean_score = float(np.mean(scores))
+        std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+        evaluations.append(
+            {
+                "params": params,
+                "mean_score": mean_score,
+                "std_score": std_score,
+                "duration_seconds": duration,
+            }
+        )
+        LOGGER.info(
+            "Tuning candidate %d/%d: %s=%.3f (±%.3f) in %.2f seconds",
+            index,
+            iterations,
+            scoring,
+            mean_score,
+            std_score,
+            duration,
+        )
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = params
+
+    payload: Dict[str, object] = {
+        "enabled": True,
+        "scoring": scoring,
+        "iterations": iterations,
+        "total_combinations": total_combinations,
+        "best_params": best_params,
+        "best_score": best_score,
+        "evaluations": evaluations,
+    }
+    return payload
 
 
 def build_model(model_name: str = "gradient_boosting", *, random_state: int = 42) -> Pipeline:
@@ -314,15 +446,18 @@ def load_metrics(path: Path | str) -> Dict[str, object]:
 __all__ = [
     "KOI_FEATURE_COLUMNS",
     "MODEL_REGISTRY",
+    "MODEL_TUNING_GRID",
     "ModelSpec",
     "build_model",
     "compute_specificity",
     "cross_validate_model",
     "evaluate_predictions",
     "get_model_registry",
+    "get_tuning_grid",
     "load_metrics",
     "load_model",
     "save_metrics",
     "save_model",
     "summarise_basic_metrics",
+    "tune_hyperparameters",
 ]

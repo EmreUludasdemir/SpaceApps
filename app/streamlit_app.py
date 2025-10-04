@@ -111,6 +111,21 @@ def render_metrics_section(metrics: Dict[str, object] | None) -> None:
         description = metrics.get("best_model_description") or ""
         st.markdown(f"**Selected model:** `{best_model}` — {description}")
 
+    tuning = metrics.get("tuning") if isinstance(metrics, dict) else None
+    if tuning and tuning.get("enabled"):
+        score = tuning.get("best_score")
+        iterations = tuning.get("iterations")
+        total = tuning.get("total_combinations")
+        scoring = tuning.get("scoring")
+        st.markdown(
+            f"**Hyperparameter tuning:** optimised `{scoring}` over {iterations}/{total} sampled combinations."
+        )
+        if isinstance(score, (int, float)):
+            st.caption(f"Best mean CV score: {score:.3f}")
+        best_params = tuning.get("best_params")
+        if isinstance(best_params, dict) and best_params:
+            st.json(best_params)
+
     class_report = metrics.get("classification_report")
     if class_report:
         class_report_df = pd.DataFrame(class_report).T
